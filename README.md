@@ -1,2 +1,71 @@
-# smartcontextmemory
-Smart Context Memory - A project by 13-year-old intellectuals who are studying AI and want to launch a startup in the field.
+# SCM Pro — структурный компрессор контекста для кода
+
+Индексирует код, строит скелеты/дерево (tree-sitter для Java, ast для Python),
+в LLM отправляет только нужное: скелет для обзора, тело 1 метода + его
+зависимости для фикса. Метрики честные (`len(bytes)`, без `getsizeof`).
+
+## Установка
+
+```bat
+pip install -r requirements.txt
+```
+
+## Запуск
+
+Демо пайплайна:
+```bat
+python main.py
+```
+
+Интерактивная консоль (вопросы по проекту, индекс кэшируется на диске):
+```bat
+python chat.py
+```
+Принудительная пересборка индекса (если что-то пошло не так):
+```bat
+python chat.py --reindex
+```
+
+Один вопрос без интерактива:
+```bat
+python chat.py --once "Каковы лимиты памяти в коде?"
+```
+
+Индексация своей папки с кодом (.java/.py/.md/.txt, до 500 файлов и 5 МБ):
+```bat
+python chat.py --repo path\to\project --once "где обработка урона?"
+```
+
+Анализ своего кода/текста с экономией токенов:
+```bat
+python chat.py --analyze-file path\to\File.java
+```
+
+Анализ целой папки одним вызовом (итоги + скелеты по файлам):
+```bat
+python chat.py --analyze-batch path\to\project
+```
+
+Внутри консоли: `/code` — вставить свой код (конец — строка `END`),
+`exit` — выход. Живые ответы — через Ollama на `localhost:11434`
+(`ollama pull qwen2.5:3b`), без нее консоль показывает честный контекст
+и метрики без выдуманного ответа.
+
+## Файлы
+
+- `scm_core.py` — ядро: роутер, чистка, скелеты, Java-дерево (tree-sitter +
+  regex-фолбэк), zlib-хранение, VRAM-симуляция
+- `main.py` — демо end-to-end на `input_data.txt`
+- `chat.py` — консоль: FAISS-поиск, фокус на метод, анализ вставок
+- `serve.py` — серверный режим (модель грузится раз): `POST /ask`
+- `SKILL.md` — описание скилла для моделей: воркфлоу, команды, правила
+  (машинный вывод — те же команды с `--json`)
+- `input_data.txt` — тестовые данные для демо
+- `.scm_index/` — кэш FAISS-индекса (создается сам, можно удалять)
+
+## Честные ограничения
+
+- VRAM — симуляция на dict, не real CUDA (смотри `torch.cuda` сам)
+- zlib — только хранение в RAM, модель его не читает
+- Демо-Java-парсер пропускает сложный синтаксис; прод — tree-sitter
+- Токены без `tiktoken` считаются эвристикой ~4 символа
