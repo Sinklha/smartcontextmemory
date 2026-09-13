@@ -3,6 +3,10 @@ import sys
 import asyncio
 import hashlib
 import time
+import warnings as _warnings
+
+_warnings.filterwarnings("ignore", category=DeprecationWarning)
+_warnings.filterwarnings("ignore", message=".*LangChain.*")
 
 try:
     if sys.stdout is not None:

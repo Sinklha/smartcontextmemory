@@ -7,10 +7,20 @@
 ## Установка
 
 ```bat
-pip install -r requirements.txt
+install.bat
+```
+Ставит зависимости, кладет скилл `scm-context` в OpenCode.
+Другой хост (Claude Code, Cursor, Codex): 
+```bat
+python install.py --host claude
+```
+SKILL.md — стандартный Agent Skills, переделок не требует.
+Быстрое демо без модели (10 секунд):
+```bat
+demo.bat
 ```
 
-## Запуск
+## Запуск вручную
 
 Демо пайплайна:
 ```bat
@@ -31,7 +41,7 @@ python chat.py --reindex
 python chat.py --once "Каковы лимиты памяти в коде?"
 ```
 
-Индексация своей папки с кодом (.java/.py/.md/.txt, до 500 файлов и 5 МБ):
+Индексация своей папки с кодом (.java/.py/.md/.txt, до 2000 файлов и 20 МБ):
 ```bat
 python chat.py --repo path\to\project --once "где обработка урона?"
 ```

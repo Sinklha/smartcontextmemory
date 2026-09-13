@@ -728,9 +728,17 @@ def _java_prod_parse_local(code: str) -> dict:
         invoked: set[str] = set()
         created: set[str] = set()
         if body_n is not None:
-            for c in caps("(method_invocation name: (identifier) @c)",
-                          body_n).get("c", []):
-                invoked.add(_ts_text(src, c))
+            # Связью считаем только свои вызовы: голые (foo()), this/super
+            # и статику своего класса. map.put(), log.info() и new X().k()
+            # с чужим получателем — не наши методы (раньше склеивались по имени).
+            for inv in caps("(method_invocation) @inv", body_n).get("inv", []):
+                nm = inv.child_by_field_name("name")
+                if nm is None:
+                    continue
+                ob = inv.child_by_field_name("object")
+                recv = _ts_text(src, ob).strip() if ob is not None else ""
+                if not recv or recv in ("this", "super", cls_name):
+                    invoked.add(_ts_text(src, nm))
             for c in caps("(object_creation_expression type: (type_identifier) @c)",
                           body_n).get("c", []):
                 created.add(_ts_text(src, c))
@@ -967,6 +975,27 @@ def suggest_focus(query: str, anchors: list[dict]) -> str:
         return ""
     best = max(scores.values())
     return next(k for k in order if scores[k] == best)
+
+
+def resolve_focus_target(parsed: dict, anchors: list[dict], arg) -> str:
+    """Имя целевого метода: точное имя > якоря из вопроса > '' (авто по умолчанию).
+
+    arg: None/'' — авто; 'onHit' — точное имя; 'где чинится урон?' — вопрос.
+    """
+    methods = (parsed or {}).get("methods", [])
+    if not methods:
+        return ""
+    if arg and str(arg).strip():
+        a = str(arg).strip()
+        for m in methods:
+            if m["name"].lower() == a.lower():
+                return m["name"]
+        sug = suggest_focus(a, anchors or [])
+        base = sug.split(".")[-1]
+        for m in methods:
+            if m["name"] == base:
+                return m["name"]
+    return ""
 
 
 def compress_text_semantic(text_lines) -> dict:

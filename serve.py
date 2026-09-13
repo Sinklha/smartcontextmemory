@@ -77,6 +77,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             out = {"query": q,
                    "retr_ms": round(r["retr_ms"], 1),
+                   "found": r["found"],
                    "server_ms": round((time.perf_counter() - t0) * 1000, 1),
                    "hits": [{"score": round(s, 4), "file": m["file"],
                              "chunk": m["chunk_id"], "snippet": t[:300]}
