@@ -107,6 +107,8 @@ def semantic_clean_code(code: str) -> str:
 
     - вырезает /*...*/ блоки,
     - удаляет полно-строчные # и // комментарии,
+      КРОМЕ строк с метками TODO/FIXME/WARNING/NOTE/HACK/XXX —
+      они едут в LLM (дешево, спасает предупреждения, пункт из PLAN),
     - режет инлайн-комментарии вида '  # ...' и '  // ...',
     - убирает висячие пробелы и пустые строки.
     Структура кода сохраняется, поведение — нет гарантии для строковых
@@ -119,6 +121,11 @@ def semantic_clean_code(code: str) -> str:
         if not stripped:
             continue
         if stripped.startswith("#") or stripped.startswith("//"):
+            up = stripped.upper()
+            if ("TODO" in up or "FIXME" in up or "WARNING" in up
+                    or "NOTE" in up or "HACK" in up or up.startswith("# XXX")
+                    or "XXX" in up):
+                out.append(line.rstrip())
             continue
         # инлайн-комментарии: только если перед # или // есть пробел
         # (чтобы не резать 'port=5432' или '://').
@@ -562,29 +569,85 @@ def _ts_field_text(src: bytes, node, field: str) -> str:
     return _ts_text(src, child) if child is not None else ""
 
 
-def java_prod_parse(code: str) -> dict:
-    """ПРОД-парсер Java на tree-sitter: настоящий синтаксис, а не регулярки.
+def _ts_index_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".scm_index", "trees")
 
-    Понимает Java 16+ (pattern matching instanceof, record), '{' на новой
-    строке, лямбды; методы вложенных классов внешнему не приписывает.
-    Битый код не роняет: помечается has_error=True, разбор продолжается.
-    Выход — тот же формат, что у java_demo_parse (списки calls/uses_imports
-    здесь полные, без обрезки).
 
-    Надежность: свежие Windows-сборки py-tree-sitter иногда роняют процесс
-    (access violation при массовых разборах — баг нативного слоя, не наш).
-    Поэтому разбор едет в отдельном воркере (_ts_worker.py): его падение
-    превращается в исключение и фолбэк, а не в смерть хоста. Плюс кэш
-    разобранных деревьев на диске (.scm_index/trees) — повторы бесплатны.
-    Бросает исключение, если разобрать нельзя, — вызывай через java_parse().
-    """
+def _ts_good_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".scm_index", "ts_good.json")
+
+
+def _ts_good_load() -> set:
+    try:
+        import json as _json
+        with open(_ts_good_path(), encoding="utf-8") as f:
+            data = _json.load(f)
+        return set(data) if isinstance(data, list) else set()
+    except Exception:
+        return set()
+
+
+def _ts_good_save(good: set) -> None:
+    try:
+        import json as _json
+        os.makedirs(os.path.dirname(_ts_good_path()), exist_ok=True)
+        with open(_ts_good_path(), "w", encoding="utf-8") as f:
+            _json.dump(sorted(good), f)
+    except Exception:
+        pass
+
+
+def _ts_hash(code: str) -> str:
     import hashlib as _hl
+    return _hl.sha1(code.encode("utf-8")).hexdigest()
+
+
+def _ts_cache_path(code: str) -> str:
+    return os.path.join(_ts_index_dir(), _ts_hash(code) + ".json")
+
+
+def _ts_versions() -> str:
+    """Версии нативного слоя: tombstone привязан к ним (новый билд
+    мог починить падение — тогда воркер пробуем заново)."""
+    try:
+        from importlib.metadata import version as _v
+        return _v("tree-sitter") + "/" + _v("tree-sitter-java")
+    except Exception:
+        return "unknown"
+
+
+def _ts_tombstone_read(code: str):
+    """Падучий хеш с теми же версиями натива: воркер уже умирал,
+    повторять 10-секундный краш не надо — сразу в regex-фолбэк."""
     import json as _json
-    import subprocess as _sp
-    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             ".scm_index", "trees")
-    key = _hl.sha1(code.encode("utf-8")).hexdigest() + ".json"
-    cp = os.path.join(cache_dir, key)
+    cp = _ts_cache_path(code)
+    if os.path.exists(cp):
+        try:
+            with open(cp, encoding="utf-8") as f:
+                hit = _json.load(f)
+            if (isinstance(hit, dict) and hit.get("ts_crash") is True
+                    and hit.get("native") == _ts_versions()):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _ts_tombstone_write(code: str) -> None:
+    import json as _json
+    try:
+        with open(_ts_cache_path(code), "w", encoding="utf-8") as f:
+            _json.dump({"ts_crash": True, "native": _ts_versions()},
+                       f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _ts_cache_read(code: str):
+    import json as _json
+    cp = _ts_cache_path(code)
     if os.path.exists(cp):
         try:
             with open(cp, encoding="utf-8") as f:
@@ -593,6 +656,27 @@ def java_prod_parse(code: str) -> dict:
                 return hit
         except Exception:
             pass
+    return None
+
+
+def _ts_cache_write(code: str, out: dict) -> None:
+    import json as _json
+    cp = _ts_cache_path(code)
+    try:
+        os.makedirs(os.path.dirname(cp), exist_ok=True)
+        with open(cp, "w", encoding="utf-8") as f:
+            _json.dump(out, f, ensure_ascii=False)
+        _ts_cache_evict(os.path.dirname(cp))
+    except Exception:
+        pass
+
+
+def _ts_run_worker(code: str) -> dict:
+    """Безопасный разбор: отдельный процесс для Windows-сборок
+    py-tree-sitter с access violation. Падение ребенка = исключение
+    у родителя, а не смерть хоста. Вызывай через java_prod_parse()."""
+    import json as _json
+    import subprocess as _sp
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "_ts_worker.py")
     try:
@@ -608,13 +692,52 @@ def java_prod_parse(code: str) -> dict:
         raise RuntimeError(f"ts-worker bad json: {e}")
     if not isinstance(out, dict) or "methods" not in out:
         raise RuntimeError("ts-worker bad shape")
+    return out
+
+
+def java_prod_parse(code: str) -> dict:
+    """ПРОД-парсер Java на tree-sitter: настоящий синтаксис, а не регулярки.
+
+    Понимает Java 16+ (pattern matching instanceof, record), '{' на новой
+    строке, лямбды; методы вложенных классов внешнему не приписывает.
+    Битый код не роняет: помечается has_error=True, разбор продолжается.
+    Выход — тот же формат, что у java_demo_parse (списки calls/uses_imports
+    здесь полные, без обрезки).
+
+    Порядок (скорость + защита от падения процесса):
+    1) кэш разобранных деревьев на диске — повторы бесплатны;
+    2) tombstone падучего хеша (при тех же версиях натива) — сразу
+       исключение в regex-фолбэк, без повторного 10-секундного краша;
+    3) хеш уже проверен как безопасный (ts_good.json) — прямой разбор
+       в этом процессе, быстро, без IPC;
+    4) новый/непроверенный код — отдельный воркер (_ts_worker.py):
+       его падение превращается в исключение и фолбэк в демо-regex
+       через java_parse(), а не в смерть хоста. Успех помечает хеш
+       безопасным, смерть — пишет tombstone.
+    На практике (Ouranos, 94 файла): 91 файл разбирается локально,
+    3 падучих (TypeConverter, Binary, BinaryStream) идут в regex-фолбэк
+    без падений и без повторных крашей.
+    Бросает исключение, если разобрать нельзя, — вызывай через java_parse().
+    """
+    hit = _ts_cache_read(code)
+    if hit is not None:
+        return hit
+    if _ts_tombstone_read(code):
+        raise RuntimeError("ts-worker: known crash for this hash (tombstone)")
+    h = _ts_hash(code)
+    if h in _ts_good_load():
+        out = _java_prod_parse_local(code)
+        _ts_cache_write(code, out)
+        return out
     try:
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(cp, "w", encoding="utf-8") as f:
-            _json.dump(out, f, ensure_ascii=False)
-        _ts_cache_evict(cache_dir)
+        out = _ts_run_worker(code)
     except Exception:
-        pass
+        _ts_tombstone_write(code)
+        raise
+    _ts_cache_write(code, out)
+    good = _ts_good_load()
+    good.add(h)
+    _ts_good_save(good)
     return out
 
 
@@ -727,6 +850,7 @@ def _java_prod_parse_local(code: str) -> dict:
         body = _ts_text(src, m)
         invoked: set[str] = set()
         created: set[str] = set()
+        idents: set[str] = set()
         if body_n is not None:
             # Связью считаем только свои вызовы: голые (foo()), this/super
             # и статику своего класса. map.put(), log.info() и new X().k()
@@ -742,6 +866,16 @@ def _java_prod_parse_local(code: str) -> dict:
             for c in caps("(object_creation_expression type: (type_identifier) @c)",
                           body_n).get("c", []):
                 created.add(_ts_text(src, c))
+        # Все имена-узлы метода (без комментариев и строковых литералов):
+        # поля и импорты ищем только среди них, а не regex по тексту.
+        for _q in ("((identifier) @id)", "((type_identifier) @id)"):
+            try:
+                for _n in caps(_q, m).get("id", []):
+                    _t = _ts_text(src, _n)
+                    if _t:
+                        idents.add(_t)
+            except Exception:
+                pass
         methods.append({
             "name": name, "class": cls_name,
             "params": params, "annotations": anns,
@@ -749,6 +883,7 @@ def _java_prod_parse_local(code: str) -> dict:
             "sig": f"{name}({params}): ...",
             "body": body, "body_bytes": bytes_len(body),
             "_calls_raw": sorted(invoked) + sorted("new:" + c for c in created),
+            "_idents": sorted(idents),
         })
 
     # --- поля (свежий обход, тексты сразу) ---
@@ -771,20 +906,22 @@ def _java_prod_parse_local(code: str) -> dict:
                 stack.append(ch)
     fnames = [f["name"] for f in fields]
 
-    # --- связи (чистый Python по уже извлеченным строкам) ---
+    # --- связи (чистый Python по уже извлеченным AST-данным) ---
+    # calls: только method_invocation из AST (собрано выше в invoked),
+    # uses_fields/uses_imports: только identifier-узлы AST, а не regex
+    # по сырому тексту (regex ловил слова в комментариях и строках).
     for m in methods:
         raw = m.pop("_calls_raw")
         raw_calls = [c for c in raw if not c.startswith("new:")]
         raw_news = [c[4:] for c in raw if c.startswith("new:")]
         body = m["body"]
+        idents = set(m.pop("_idents", []))
         m["calls"] = sorted((set(raw_calls) & set(names) - {m["name"]})
                             | (set(raw_news) & declared_types))
-        m["uses_fields"] = sorted({w for w in re.findall(r"\b\w+\b", body)
-                                   if w in fnames})
+        m["uses_fields"] = sorted(idents & set(fnames))
         m["uses_imports"] = sorted(
             {imp["full"] for imp in imports
-             if re.search(r"\b" + re.escape(imp["simple"]) + r"\b",
-                          m["sig"] + body)})
+             if imp["simple"] in idents})
         m["event"] = ""
         if any("EventHandler" in a for a in m["annotations"]):
             pm = re.match(r"\s*([\w<>\[\]]+)\s+\w+\s*$", m["params"].strip())
